@@ -86,14 +86,14 @@ while read -r line; do
           tools: [
             {
               name: "search-articles",
-              description: "Search through articles in your Unread RSS reader database using keyword-based fulltext search. This is NOT a semantic/vector search - use specific keywords, boolean operators (AND, OR, NOT), and exact phrases in quotes. The search covers article titles, content, authors, and feed names.",
+              description: "Search through articles in your Unread RSS reader database using keyword-based fulltext search. This is NOT a semantic/vector search - use specific keywords, boolean operators (AND, OR, NOT), and exact phrases in quotes. The search covers article titles, content, authors, and feed names. Use * or empty query to get the most recently read articles.",
               inputSchema: {
                 type: "object",
                 properties: {
                   query: { 
                     title: "Search Query", 
                     type: "string",
-                    description: "Keyword search query. Supports: simple keywords (bicycle, javascript), boolean operators (AI OR artificial intelligence, python NOT django), exact phrases (\"climate change\"), and combinations. Searches across title, content, author, and feed name." 
+                    description: "Keyword search query. Supports: simple keywords (bicycle, javascript), boolean operators (AI OR artificial intelligence, python NOT django), exact phrases (\"climate change\"), and combinations. Searches across title, content, author, and feed name. Use * or leave empty to get most recently read articles." 
                   },
                   filter: {
                     title: "Filter",
@@ -213,44 +213,85 @@ while read -r line; do
               ;;
           esac
           
-          # Execute search query
-          if [ "$include_content" = "true" ]; then
-            # Include content snippet
-            sql_query="SELECT 
-              a.title, 
-              a.feedName, 
-              a.author,
-              a.articleURL,
-              datetime(a.publishedDate, 'unixepoch') as published,
-              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-              substr(a.unrSummary, 1, 500) as content_preview,
-              snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
-            FROM articles a 
-            JOIN search_articles s ON a.search_articles_rowid = s.rowid 
-            WHERE a.archived=0 
-              $filter_clause
-              AND search_articles MATCH '$query' 
-            ORDER BY a.publishedDate DESC 
-            LIMIT $limit;"
+          # Check if query is empty or wildcard - if so, return recently read articles
+          if [ -z "$query" ] || [ "$query" = "*" ]; then
+            # Return most recently read articles
+            if [ "$include_content" = "true" ]; then
+              sql_query="SELECT 
+                a.title, 
+                a.feedName, 
+                a.author,
+                a.articleURL,
+                datetime(a.publishedDate, 'unixepoch') as published,
+                datetime(a.mark_read_date, 'unixepoch') as read_date,
+                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+                substr(a.unrSummary, 1, 500) as content_preview
+              FROM articles a 
+              WHERE a.archived=0 
+                AND a.read=1
+                AND a.mark_read_date IS NOT NULL
+                $filter_clause
+              ORDER BY a.mark_read_date DESC 
+              LIMIT $limit;"
+            else
+              sql_query="SELECT 
+                a.title, 
+                a.feedName,
+                a.author, 
+                a.articleURL,
+                datetime(a.publishedDate, 'unixepoch') as published,
+                datetime(a.mark_read_date, 'unixepoch') as read_date,
+                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred
+              FROM articles a 
+              WHERE a.archived=0 
+                AND a.read=1
+                AND a.mark_read_date IS NOT NULL
+                $filter_clause
+              ORDER BY a.mark_read_date DESC 
+              LIMIT $limit;"
+            fi
           else
-            # Without content
-            sql_query="SELECT 
-              a.title, 
-              a.feedName,
-              a.author, 
-              a.articleURL,
-              datetime(a.publishedDate, 'unixepoch') as published,
-              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-              snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
-            FROM articles a 
-            JOIN search_articles s ON a.search_articles_rowid = s.rowid 
-            WHERE a.archived=0 
-              $filter_clause
-              AND search_articles MATCH '$query' 
-            ORDER BY a.publishedDate DESC 
-            LIMIT $limit;"
+            # Execute search query with FTS
+            if [ "$include_content" = "true" ]; then
+              # Include content snippet
+              sql_query="SELECT 
+                a.title, 
+                a.feedName, 
+                a.author,
+                a.articleURL,
+                datetime(a.publishedDate, 'unixepoch') as published,
+                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+                substr(a.unrSummary, 1, 500) as content_preview,
+                snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
+              FROM articles a 
+              JOIN search_articles s ON a.search_articles_rowid = s.rowid 
+              WHERE a.archived=0 
+                $filter_clause
+                AND search_articles MATCH '$query' 
+              ORDER BY a.publishedDate DESC 
+              LIMIT $limit;"
+            else
+              # Without content
+              sql_query="SELECT 
+                a.title, 
+                a.feedName,
+                a.author, 
+                a.articleURL,
+                datetime(a.publishedDate, 'unixepoch') as published,
+                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+                snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
+              FROM articles a 
+              JOIN search_articles s ON a.search_articles_rowid = s.rowid 
+              WHERE a.archived=0 
+                $filter_clause
+                AND search_articles MATCH '$query' 
+              ORDER BY a.publishedDate DESC 
+              LIMIT $limit;"
+            fi
           fi
           
           # Log SQL query
@@ -263,11 +304,19 @@ while read -r line; do
           if [ $exit_code -eq 0 ]; then
             # Parse results and create formatted response
             if [ -z "$results" ] || [ "$results" = "[]" ]; then
-              result_text="No articles found matching query: $query"
+              if [ -z "$query" ] || [ "$query" = "*" ]; then
+                result_text="No recently read articles found"
+              else
+                result_text="No articles found matching query: $query"
+              fi
             else
               # Count results
               count=$(echo "$results" | jq 'length')
-              result_text="Found $count articles matching query: $query\n\n"
+              if [ -z "$query" ] || [ "$query" = "*" ]; then
+                result_text="$count most recently read articles:\n\n"
+              else
+                result_text="Found $count articles matching query: $query\n\n"
+              fi
               
               # Format each result
               for i in $(seq 0 $((count - 1))); do
@@ -277,6 +326,7 @@ while read -r line; do
                 author=$(echo "$article" | jq -r '.author // ""')
                 url=$(echo "$article" | jq -r '.articleURL // ""')
                 published=$(echo "$article" | jq -r '.published // ""')
+                read_date=$(echo "$article" | jq -r '.read_date // ""')
                 status=$(echo "$article" | jq -r '.status // ""')
                 starred=$(echo "$article" | jq -r '.starred // ""')
                 matched=$(echo "$article" | jq -r '.matched_text // ""')
@@ -285,6 +335,7 @@ while read -r line; do
                 result_text="${result_text}   Feed: $feed\n"
                 [ -n "$author" ] && result_text="${result_text}   Author: $author\n"
                 result_text="${result_text}   Published: $published\n"
+                [ -n "$read_date" ] && result_text="${result_text}   Read on: $read_date\n"
                 result_text="${result_text}   Status: $status"
                 [ "$starred" = "starred" ] && result_text="${result_text} ⭐"
                 result_text="${result_text}\n"
