@@ -1,0 +1,16 @@
+# Logs
+requests.log
+*.log
+
+# macOS
+.DS_Store
+
+# Editor directories and files
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Test output
+test-output/

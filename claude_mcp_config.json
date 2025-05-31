@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "unread-search": {
+      "command": "/Users/trieloff/Developer/unread-mcp/unread-mcp.sh"
+    }
+  }
+}
