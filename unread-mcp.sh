@@ -110,14 +110,23 @@ while read -r line; do
                     default: 20,
                     description: "Maximum number of results to return"
                   },
-                  include_content: {
-                    title: "Include Content",
-                    type: "boolean",
-                    default: false,
-                    description: "Include article content preview in results (first 500 chars)"
-                  }
                 },
                 required: ["query"]
+              }
+            },
+            {
+              name: "get-article",
+              description: "Retrieve the full text content of a specific article by its ID. Use this after searching to read the complete article.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  article_id: {
+                    title: "Article ID",
+                    type: "string",
+                    description: "The unique article ID obtained from search results"
+                  }
+                },
+                required: ["article_id"]
               }
             },
             {
@@ -197,7 +206,6 @@ while read -r line; do
           query=$(echo "$line" | jq -r '.params.arguments.query // empty' 2>/dev/null)
           filter=$(echo "$line" | jq -r '.params.arguments.filter // "all"' 2>/dev/null)
           limit=$(echo "$line" | jq -r '.params.arguments.limit // 20' 2>/dev/null)
-          include_content=$(echo "$line" | jq -r '.params.arguments.include_content // false' 2>/dev/null)
           
           # Build SQL query based on filter
           filter_clause=""
@@ -216,82 +224,45 @@ while read -r line; do
           # Check if query is empty or wildcard - if so, return recently read articles
           if [ -z "$query" ] || [ "$query" = "*" ]; then
             # Return most recently read articles
-            if [ "$include_content" = "true" ]; then
-              sql_query="SELECT 
-                a.title, 
-                a.feedName, 
-                a.author,
-                a.articleURL,
-                datetime(a.publishedDate, 'unixepoch') as published,
-                datetime(a.mark_read_date, 'unixepoch') as read_date,
-                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-                substr(a.unrSummary, 1, 500) as content_preview
-              FROM articles a 
-              WHERE a.archived=0 
-                AND a.read=1
-                AND a.mark_read_date IS NOT NULL
-                $filter_clause
-              ORDER BY a.mark_read_date DESC 
-              LIMIT $limit;"
-            else
-              sql_query="SELECT 
-                a.title, 
-                a.feedName,
-                a.author, 
-                a.articleURL,
-                datetime(a.publishedDate, 'unixepoch') as published,
-                datetime(a.mark_read_date, 'unixepoch') as read_date,
-                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred
-              FROM articles a 
-              WHERE a.archived=0 
-                AND a.read=1
-                AND a.mark_read_date IS NOT NULL
-                $filter_clause
-              ORDER BY a.mark_read_date DESC 
-              LIMIT $limit;"
-            fi
+            # Return most recently read articles - always include a brief preview
+            sql_query="SELECT 
+              a.uniqueID,
+              a.title, 
+              a.feedName,
+              a.author, 
+              a.articleURL,
+              datetime(a.publishedDate, 'unixepoch') as published,
+              datetime(a.mark_read_date, 'unixepoch') as read_date,
+              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+              substr(a.unrSummary, 1, 300) as content_preview
+            FROM articles a 
+            WHERE a.archived=0 
+              AND a.read=1
+              AND a.mark_read_date IS NOT NULL
+              $filter_clause
+            ORDER BY a.mark_read_date DESC 
+            LIMIT $limit;"
           else
-            # Execute search query with FTS
-            if [ "$include_content" = "true" ]; then
-              # Include content snippet
-              sql_query="SELECT 
-                a.title, 
-                a.feedName, 
-                a.author,
-                a.articleURL,
-                datetime(a.publishedDate, 'unixepoch') as published,
-                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-                substr(a.unrSummary, 1, 500) as content_preview,
-                snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
-              FROM articles a 
-              JOIN search_articles s ON a.search_articles_rowid = s.rowid 
-              WHERE a.archived=0 
-                $filter_clause
-                AND search_articles MATCH '$query' 
-              ORDER BY a.publishedDate DESC 
-              LIMIT $limit;"
-            else
-              # Without content
-              sql_query="SELECT 
-                a.title, 
-                a.feedName,
-                a.author, 
-                a.articleURL,
-                datetime(a.publishedDate, 'unixepoch') as published,
-                CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-                CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-                snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
-              FROM articles a 
-              JOIN search_articles s ON a.search_articles_rowid = s.rowid 
-              WHERE a.archived=0 
-                $filter_clause
-                AND search_articles MATCH '$query' 
-              ORDER BY a.publishedDate DESC 
-              LIMIT $limit;"
-            fi
+            # Execute search query with FTS - always include brief preview
+            sql_query="SELECT 
+              a.uniqueID,
+              a.title, 
+              a.feedName,
+              a.author, 
+              a.articleURL,
+              datetime(a.publishedDate, 'unixepoch') as published,
+              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+              substr(a.unrSummary, 1, 300) as content_preview,
+              snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
+            FROM articles a 
+            JOIN search_articles s ON a.search_articles_rowid = s.rowid 
+            WHERE a.archived=0 
+              $filter_clause
+              AND search_articles MATCH '$query' 
+            ORDER BY a.publishedDate DESC 
+            LIMIT $limit;"
           fi
           
           # Log SQL query
@@ -321,6 +292,7 @@ while read -r line; do
               # Format each result
               for i in $(seq 0 $((count - 1))); do
                 article=$(echo "$results" | jq -r ".[$i]")
+                article_id=$(echo "$article" | jq -r '.uniqueID // ""')
                 title=$(echo "$article" | jq -r '.title // "Untitled"')
                 feed=$(echo "$article" | jq -r '.feedName // "Unknown Feed"')
                 author=$(echo "$article" | jq -r '.author // ""')
@@ -330,6 +302,7 @@ while read -r line; do
                 status=$(echo "$article" | jq -r '.status // ""')
                 starred=$(echo "$article" | jq -r '.starred // ""')
                 matched=$(echo "$article" | jq -r '.matched_text // ""')
+                content=$(echo "$article" | jq -r '.content_preview // ""')
                 
                 result_text="${result_text}$(($i + 1)). $title\n"
                 result_text="${result_text}   Feed: $feed\n"
@@ -340,11 +313,16 @@ while read -r line; do
                 [ "$starred" = "starred" ] && result_text="${result_text} ⭐"
                 result_text="${result_text}\n"
                 [ -n "$matched" ] && result_text="${result_text}   Match: $matched\n"
+                result_text="${result_text}   Article ID: $article_id\n"
                 [ -n "$url" ] && result_text="${result_text}   URL: $url\n"
                 
-                if [ "$include_content" = "true" ]; then
-                  content=$(echo "$article" | jq -r '.content_preview // ""')
-                  [ -n "$content" ] && result_text="${result_text}   Preview: $content\n"
+                # Always show content preview if available
+                if [ -n "$content" ]; then
+                  result_text="${result_text}   Preview: $content"
+                  if [ ${#content} -ge 299 ]; then
+                    result_text="${result_text}..."
+                  fi
+                  result_text="${result_text}\n"
                 fi
                 
                 result_text="${result_text}\n"
@@ -437,6 +415,128 @@ while read -r line; do
           echo "$response"
           ;;
           
+        "get-article")
+          # Extract article ID
+          article_id=$(echo "$line" | jq -r '.params.arguments.article_id // empty' 2>/dev/null)
+          
+          if [ -z "$article_id" ]; then
+            response=$(create_error_response "$id" "-32602" "Article ID is required")
+          else
+            # Get full article content
+            article_query="SELECT 
+              a.uniqueID,
+              a.title,
+              a.feedName,
+              a.author,
+              a.articleURL,
+              datetime(a.publishedDate, 'unixepoch') as published,
+              datetime(a.mark_read_date, 'unixepoch') as read_date,
+              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+              a.unrSummary,
+              LENGTH(a.CompressedHtmlBlob) as has_html
+            FROM articles a 
+            WHERE a.uniqueID = '$article_id'
+            LIMIT 1;"
+            
+            results=$(sqlite3 -json "$DB_PATH" "$article_query" 2>&1)
+            exit_code=$?
+            
+            if [ $exit_code -eq 0 ]; then
+              if [ -z "$results" ] || [ "$results" = "[]" ]; then
+                result_text="Article not found with ID: $article_id"
+              else
+                # Parse article data
+                article=$(echo "$results" | jq -r '.[0]')
+                title=$(echo "$article" | jq -r '.title // "Untitled"')
+                feed=$(echo "$article" | jq -r '.feedName // "Unknown Feed"')
+                author=$(echo "$article" | jq -r '.author // ""')
+                url=$(echo "$article" | jq -r '.articleURL // ""')
+                published=$(echo "$article" | jq -r '.published // ""')
+                read_date=$(echo "$article" | jq -r '.read_date // ""')
+                status=$(echo "$article" | jq -r '.status // ""')
+                starred=$(echo "$article" | jq -r '.starred // ""')
+                summary=$(echo "$article" | jq -r '.unrSummary // ""')
+                has_html=$(echo "$article" | jq -r '.has_html // "0"')
+                
+                # If we have compressed HTML, extract and decompress it
+                if [ "$has_html" != "0" ] && [ "$has_html" != "null" ]; then
+                  # Export compressed blob to temp file
+                  temp_file="/tmp/article_${article_id}_compressed.zlib"
+                  sqlite3 "$DB_PATH" "SELECT writefile('$temp_file', CompressedHtmlBlob) FROM articles WHERE uniqueID = '$article_id';" 2>/dev/null
+                  
+                  if [ -f "$temp_file" ]; then
+                    # Decompress and extract text
+                    full_content=$(python3 -c "
+import zlib
+import re
+import html
+try:
+    with open('$temp_file', 'rb') as f:
+        compressed = f.read()
+    html_content = zlib.decompress(compressed).decode('utf-8')
+    # Remove HTML tags
+    text = re.sub('<[^<]+?>', ' ', html_content)
+    # Decode HTML entities
+    text = html.unescape(text)
+    # Clean up whitespace
+    text = ' '.join(text.split())
+    print(text)
+except Exception as e:
+    print('Error decompressing content')
+" 2>/dev/null)
+                    rm -f "$temp_file"
+                  else
+                    full_content=""
+                  fi
+                else
+                  full_content=""
+                fi
+                
+                # Build response
+                result_text="Article: $title\n\n"
+                result_text="${result_text}Feed: $feed\n"
+                [ -n "$author" ] && result_text="${result_text}Author: $author\n"
+                result_text="${result_text}Published: $published\n"
+                [ -n "$read_date" ] && result_text="${result_text}Read on: $read_date\n"
+                result_text="${result_text}Status: $status"
+                [ "$starred" = "starred" ] && result_text="${result_text} ⭐"
+                result_text="${result_text}\n"
+                [ -n "$url" ] && result_text="${result_text}URL: $url\n"
+                result_text="${result_text}\n--- Content ---\n\n"
+                
+                # Use full content if available, otherwise use summary
+                if [ -n "$full_content" ] && [ "$full_content" != "Error decompressing content" ]; then
+                  result_text="${result_text}$full_content"
+                elif [ -n "$summary" ]; then
+                  result_text="${result_text}[Summary only - full HTML content not available]\n\n$summary"
+                else
+                  result_text="${result_text}[No content available]"
+                fi
+              fi
+              
+              response=$(jq -cn --arg id "$id" --arg text "$result_text" '{
+                jsonrpc: "2.0",
+                id: ($id | tonumber),
+                result: {
+                  content: [
+                    {
+                      type: "text",
+                      text: $text
+                    }
+                  ],
+                  isError: false
+                }
+              }')
+            else
+              response=$(create_error_response "$id" "-32603" "Database error: $results")
+            fi
+          fi
+          
+          echo "<< $response" >> "$LOG_FILE"
+          echo "$response"
+          ;;
+          
         "list-feeds")
           # Get feed list
           limit=$(echo "$line" | jq -r '.params.arguments.limit // 30' 2>/dev/null)
@@ -512,12 +612,14 @@ while read -r line; do
           
           # Search within specific feed
           sql_query="SELECT 
+            a.uniqueID,
             a.title,
             a.author,
             a.articleURL,
             datetime(a.publishedDate, 'unixepoch') as published,
             CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
             CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+            substr(a.unrSummary, 1, 300) as content_preview,
             snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
           FROM articles a 
           JOIN search_articles s ON a.search_articles_rowid = s.rowid 
@@ -540,6 +642,7 @@ while read -r line; do
               
               for i in $(seq 0 $((count - 1))); do
                 article=$(echo "$results" | jq -r ".[$i]")
+                article_id=$(echo "$article" | jq -r '.uniqueID // ""')
                 title=$(echo "$article" | jq -r '.title // "Untitled"')
                 author=$(echo "$article" | jq -r '.author // ""')
                 url=$(echo "$article" | jq -r '.articleURL // ""')
@@ -547,6 +650,7 @@ while read -r line; do
                 status=$(echo "$article" | jq -r '.status // ""')
                 starred=$(echo "$article" | jq -r '.starred // ""')
                 matched=$(echo "$article" | jq -r '.matched_text // ""')
+                content=$(echo "$article" | jq -r '.content_preview // ""')
                 
                 result_text="${result_text}$(($i + 1)). $title\n"
                 [ -n "$author" ] && result_text="${result_text}   Author: $author\n"
@@ -555,7 +659,19 @@ while read -r line; do
                 [ "$starred" = "starred" ] && result_text="${result_text} ⭐"
                 result_text="${result_text}\n"
                 [ -n "$matched" ] && result_text="${result_text}   Match: $matched\n"
-                [ -n "$url" ] && result_text="${result_text}   URL: $url\n\n"
+                result_text="${result_text}   Article ID: $article_id\n"
+                [ -n "$url" ] && result_text="${result_text}   URL: $url\n"
+                
+                # Always show content preview if available
+                if [ -n "$content" ]; then
+                  result_text="${result_text}   Preview: $content"
+                  if [ ${#content} -ge 299 ]; then
+                    result_text="${result_text}..."
+                  fi
+                  result_text="${result_text}\n"
+                fi
+                
+                result_text="${result_text}\n"
               done
             fi
             

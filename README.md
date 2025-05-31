@@ -48,7 +48,14 @@ Search through all articles using keywords:
 - Simple keywords: `bicycle`, `javascript`
 - Boolean operators: `AI OR artificial intelligence`, `python NOT django`
 - Exact phrases: `"climate change"`
+- Use `*` or empty query to get most recently read articles
 - Filter by status: starred, read, unread
+- Returns brief preview (~300 chars) and article ID
+
+### get-article
+Retrieve the full text content of a specific article:
+- Use the article ID from search results
+- Returns complete article content with metadata
 
 ### get-stats
 Get database statistics including total articles, unread count, starred count
@@ -58,6 +65,7 @@ List all RSS feeds with article counts
 
 ### search-by-feed
 Search articles within a specific feed
+- Returns brief preview and article ID
 
 ## Examples
 
