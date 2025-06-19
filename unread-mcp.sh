@@ -12,7 +12,44 @@ mkdir -p "$(dirname "$LOG_FILE")"
 # Empty log file and add startup message
 echo "Starting unread-mcp.sh at $(date)" > "$LOG_FILE"
 
-# Helper function to create JSON responses
+# Send JSON-RPC response
+send_response() {
+    local response="$1"
+    echo "$response"
+    echo "<< $response" >> "$LOG_FILE"
+}
+
+# Error response
+error_response() {
+    local id="$1"
+    local code="$2"
+    local message="$3"
+    local response
+    response=$(jq -cn --argjson id "$id" --argjson code "$code" --arg message "$message" '{
+        jsonrpc: "2.0",
+        id: $id,
+        error: {
+            code: $code,
+            message: $message
+        }
+    }')
+    send_response "$response"
+}
+
+# Success response
+success_response() {
+    local id="$1"
+    local result="$2"
+    local response
+    response=$(jq -cn --argjson id "$id" --argjson result "$result" '{
+        jsonrpc: "2.0",
+        id: $id,
+        result: $result
+    }')
+    send_response "$response"
+}
+
+# Helper function to create JSON responses (backward compatibility)
 create_json_response() {
   local id="$1"
   local content="$2"
@@ -21,7 +58,7 @@ create_json_response() {
   echo "$response"
 }
 
-# Helper function to create error responses
+# Helper function to create error responses (backward compatibility)
 create_error_response() {
   local id="$1"
   local code="$2"
@@ -37,6 +74,122 @@ if [ ! -f "$DB_PATH" ]; then
   echo "ERROR: Unread database not found at $DB_PATH" >> "$LOG_FILE"
   exit 1
 fi
+
+# Parse query for special directives and extract search parameters
+parse_query() {
+    local query="$1"
+    
+    # Initialize variables
+    SEARCH_TYPE="articles"
+    FEED_NAME=""
+    STATUS_FILTER="all"
+    REMAINING_QUERY=""
+    
+    # Parse directives from query
+    local words=()
+    local remaining_words=()
+    
+    # Split query into words, respecting quoted strings  
+    while IFS= read -r word; do
+        words+=("$word")
+    done < <(echo "$query" | grep -oE 'feed:"[^"]*"|[^[:space:]]+')
+    
+    for word in "${words[@]}"; do
+        if [[ "$word" =~ ^type: ]]; then
+            # Extract search type
+            SEARCH_TYPE="${word#type:}"
+        elif [[ "$word" =~ ^feed: ]]; then
+            # Extract feed name, removing quotes if present
+            FEED_NAME="${word#feed:}"
+            FEED_NAME="${FEED_NAME#\"}"
+            FEED_NAME="${FEED_NAME%\"}"
+        elif [[ "$word" =~ ^status: ]]; then
+            # Extract status filter
+            STATUS_FILTER="${word#status:}"
+        else
+            # Regular search word
+            remaining_words+=("$word")
+        fi
+    done
+    
+    # Join remaining words for content search
+    REMAINING_QUERY="${remaining_words[*]}"
+    
+    # If no remaining query and no specific type, default to recent articles
+    if [[ -z "$REMAINING_QUERY" && "$SEARCH_TYPE" == "articles" ]]; then
+        REMAINING_QUERY="*"
+    fi
+}
+
+# Format dual response for cross-client compatibility
+format_dual_response() {
+    local search_results="$1"
+    local query="$2"
+    local search_type="${3:-search}"
+    
+    local count
+    count=$(echo "$search_results" | jq length)
+    
+    if [[ "$count" -eq 0 ]]; then
+        # No results
+        jq -cn --arg query "$query" '{
+            content: [
+                {
+                    type: "text",
+                    text: ("No results found for: " + $query)
+                }
+            ],
+            results: []
+        }'
+        return
+    fi
+    
+    # Format content for Claude (readable text)
+    local content_text
+    if [[ "$search_type" == "feeds" ]]; then
+        content_text="Found $count feeds:\n\n$(echo "$search_results" | jq -r '.[] | "• " + .feedName + " (" + (.article_count | tostring) + " articles, " + (.unread_count | tostring) + " unread)"' | nl)"
+    elif [[ "$search_type" == "stats" ]]; then
+        content_text=$(echo "$search_results" | jq -r '.[0] | "Unread Database Statistics:\n\nTotal Articles: " + (.total_articles | tostring) + "\nRead Articles: " + (.read_articles | tostring) + "\nUnread Articles: " + (.unread_articles | tostring) + "\nStarred Articles: " + (.starred_articles | tostring) + "\nTotal Feeds: " + (.total_feeds | tostring)')
+    else
+        content_text="Found $count articles for '$query':\n\n$(echo "$search_results" | jq -r '.[] | "• " + .title + " (" + .feedName + ")\n  ID: " + .uniqueID + "\n  Published: " + .published + "\n  Status: " + .status + (if .starred == "starred" then " ⭐" else "" end) + "\n  Preview: " + (.content_preview // "")[0:200] + "...\n"')"
+    fi
+    
+    # Format results for OpenAI (structured data)
+    local openai_results
+    if [[ "$search_type" == "feeds" ]]; then
+        openai_results=$(echo "$search_results" | jq '[.[] | {
+            id: .feedName,
+            title: .feedName,
+            text: ("Feed with " + (.article_count | tostring) + " articles (" + (.unread_count | tostring) + " unread)"),
+            url: null
+        }]')
+    elif [[ "$search_type" == "stats" ]]; then
+        openai_results=$(echo "$search_results" | jq '[.[0] | {
+            id: "stats",
+            title: "Database Statistics",
+            text: ("Total: " + (.total_articles | tostring) + ", Read: " + (.read_articles | tostring) + ", Unread: " + (.unread_articles | tostring) + ", Starred: " + (.starred_articles | tostring) + ", Feeds: " + (.total_feeds | tostring)),
+            url: null
+        }]')
+    else
+        openai_results=$(echo "$search_results" | jq '[.[] | {
+            id: .uniqueID,
+            title: .title,
+            text: (.content_preview // (.title + " from " + .feedName)),
+            url: .uniqueID
+        }]')
+    fi
+    
+    # Combine both formats
+    jq -cn --arg text "$content_text" --argjson results "$openai_results" '{
+        content: [
+            {
+                type: "text",
+                text: $text
+            }
+        ],
+        results: $results
+    }'
+}
 
 # Process incoming requests
 while read -r line; do
@@ -79,121 +232,89 @@ while read -r line; do
       ;;
       
     "tools/list")
-      response=$(jq -cn --arg id "$id" '{
-        jsonrpc: "2.0",
-        id: ($id | tonumber),
-        result: {
-          tools: [
-            {
-              name: "search-articles",
-              description: "Search through articles in your Unread RSS reader database using keyword-based fulltext search. This is NOT a semantic/vector search - use specific keywords, boolean operators (AND, OR, NOT), and exact phrases in quotes. The search covers article titles, content, authors, and feed names. Use * or empty query to get the most recently read articles.",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  query: { 
-                    title: "Search Query", 
-                    type: "string",
-                    description: "Keyword search query. Supports: simple keywords (bicycle, javascript), boolean operators (AI OR artificial intelligence, python NOT django), exact phrases (\"climate change\"), and combinations. Searches across title, content, author, and feed name. Use * or leave empty to get most recently read articles." 
-                  },
-                  filter: {
-                    title: "Filter",
-                    type: "string",
-                    enum: ["all", "starred", "unread", "read"],
-                    default: "all",
-                    description: "Filter articles by status"
-                  },
-                  limit: {
-                    title: "Limit",
-                    type: "integer",
-                    minimum: 1,
-                    maximum: 100,
-                    default: 20,
-                    description: "Maximum number of results to return"
-                  },
-                },
-                required: ["query"]
+      tools=$(jq -cn '[
+        {
+          name: "search",
+          description: "Search through articles in your Unread RSS reader database using keyword-based fulltext search. Supports special query syntax: use 'type:stats' for database statistics, 'type:feeds' to list feeds, 'feed:name' to search within specific feed, 'status:read/unread/starred' to filter by status. Returns results with article IDs for content retrieval.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "Search query with optional directives. Examples: python (search articles), type:stats (show database stats), type:feeds (list feeds), feed:Ars_Technica python (search python in feed), status:starred AI (search starred AI articles). Use * or empty for recent articles."
+              },
+              limit: {
+                type: "integer",
+                description: "Maximum number of results (default: 20)",
+                default: 20,
+                minimum: 1,
+                maximum: 100
               }
             },
-            {
-              name: "get-article",
-              description: "Retrieve the full text content of a specific article by its ID. Use this after searching to read the complete article.",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  article_id: {
-                    title: "Article ID",
-                    type: "string",
-                    description: "The unique article ID obtained from search results"
+            required: ["query"]
+          },
+          outputSchema: {
+            type: "object",
+            properties: {
+              content: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    type: { type: "string" },
+                    text: { type: "string" }
                   }
-                },
-                required: ["article_id"]
-              }
-            },
-            {
-              name: "get-stats",
-              description: "Get statistics about the Unread database including total articles, unread count, starred count, and feed information",
-              inputSchema: {
-                type: "object",
-                properties: {}
-              }
-            },
-            {
-              name: "list-feeds",
-              description: "List all RSS feeds in the database with article counts",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  limit: {
-                    title: "Limit",
-                    type: "integer",
-                    minimum: 1,
-                    maximum: 100,
-                    default: 30,
-                    description: "Maximum number of feeds to return"
+                }
+              },
+              results: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    title: { type: "string" },
+                    text: { type: "string" },
+                    url: { type: ["string", "null"] }
                   }
                 }
               }
-            },
-            {
-              name: "search-by-feed",
-              description: "Search articles within a specific feed using keyword-based fulltext search",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  feed_name: {
-                    title: "Feed Name",
-                    type: "string",
-                    description: "Exact name of the feed to search within"
-                  },
-                  query: {
-                    title: "Search Query",
-                    type: "string",
-                    description: "Keyword search query within the specified feed. Supports same syntax as search-articles."
-                  },
-                  filter: {
-                    title: "Filter",
-                    type: "string",
-                    enum: ["all", "starred", "unread", "read"],
-                    default: "all",
-                    description: "Filter articles by status"
-                  },
-                  limit: {
-                    title: "Limit",
-                    type: "integer",
-                    minimum: 1,
-                    maximum: 100,
-                    default: 20,
-                    description: "Maximum number of results to return"
-                  }
-                },
-                required: ["feed_name", "query"]
-              }
             }
-          ]
+          }
+        },
+        {
+          name: "fetch",
+          description: "Retrieve the full content of a specific article by its ID. Use article IDs from search results.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              url: {
+                type: "string",
+                description: "Article ID or URL from search results"
+              }
+            },
+            required: ["url"]
+          },
+          outputSchema: {
+            type: "object",
+            properties: {
+              content: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    type: { type: "string" },
+                    text: { type: "string" }
+                  }
+                }
+              },
+              title: { type: "string" },
+              url: { type: "string" }
+            }
+          }
         }
-      }')
-      echo "<< $response" >> "$LOG_FILE"
-      echo "$response"
+      ]')
+      
+      success_response "$id" "{ \"tools\": $tools }"
       ;;
       
     "tools/call")
@@ -201,273 +322,188 @@ while read -r line; do
       tool_method=$(echo "$line" | jq -r '.params.name // empty' 2>/dev/null)
       
       case "$tool_method" in
-        "search-articles")
+        "search")
           # Extract search parameters
           query=$(echo "$line" | jq -r '.params.arguments.query // empty' 2>/dev/null)
-          filter=$(echo "$line" | jq -r '.params.arguments.filter // "all"' 2>/dev/null)
           limit=$(echo "$line" | jq -r '.params.arguments.limit // 20' 2>/dev/null)
           
-          # Build SQL query based on filter
-          filter_clause=""
-          case "$filter" in
-            "starred")
-              filter_clause="AND a.starred=1"
+          # Parse query for directives
+          parse_query "$query"
+          
+          # Use parsed values
+          search_type="$SEARCH_TYPE"
+          feed_name="$FEED_NAME"
+          filter="$STATUS_FILTER"
+          query="$REMAINING_QUERY"
+          
+          if [[ -z "$query" ]] && [[ "$search_type" == "articles" ]]; then
+            error_response "$id" -32602 "Missing required parameter: query"
+            return
+          fi
+          
+          # Handle different search types
+          case "$search_type" in
+            "feeds")
+              # List feeds
+              sql_query="SELECT 
+                feedName,
+                COUNT(*) as article_count,
+                SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) as unread_count
+              FROM articles 
+              WHERE archived=0 AND feedName IS NOT NULL AND feedName != ''
+              GROUP BY feedName 
+              ORDER BY article_count DESC 
+              LIMIT $limit;"
               ;;
-            "unread")
-              filter_clause="AND a.read=0"
+            "stats")
+              # Get statistics
+              sql_query="SELECT 
+                COUNT(*) as total_articles,
+                SUM(CASE WHEN read=1 THEN 1 ELSE 0 END) as read_articles,
+                SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) as unread_articles,
+                SUM(CASE WHEN starred=1 THEN 1 ELSE 0 END) as starred_articles,
+                COUNT(DISTINCT feedName) as total_feeds
+              FROM articles 
+              WHERE archived=0;"
               ;;
-            "read")
-              filter_clause="AND a.read=1"
+            *)
+              # Article search
+              filter_clause=""
+              case "$filter" in
+                "starred")
+                  filter_clause="AND a.starred=1"
+                  ;;
+                "unread")
+                  filter_clause="AND a.read=0"
+                  ;;
+                "read")
+                  filter_clause="AND a.read=1"
+                  ;;
+              esac
+              
+              # Add feed filter if specified
+              feed_clause=""
+              if [[ -n "$feed_name" ]]; then
+                feed_clause="AND a.feedName = '$feed_name'"
+              fi
+              
+              # Check if query is empty or wildcard
+              if [[ -z "$query" ]] || [[ "$query" = "*" ]]; then
+                sql_query="SELECT 
+                  a.uniqueID,
+                  a.title, 
+                  a.feedName,
+                  a.author, 
+                  a.articleURL,
+                  datetime(a.publishedDate, 'unixepoch') as published,
+                  datetime(a.mark_read_date, 'unixepoch') as read_date,
+                  CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+                  CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+                  substr(a.unrSummary, 1, 300) as content_preview
+                FROM articles a 
+                WHERE a.archived=0 
+                  AND a.read=1
+                  AND a.mark_read_date IS NOT NULL
+                  $filter_clause
+                  $feed_clause
+                ORDER BY a.mark_read_date DESC 
+                LIMIT $limit;"
+              else
+                sql_query="SELECT 
+                  a.uniqueID,
+                  a.title, 
+                  a.feedName,
+                  a.author, 
+                  a.articleURL,
+                  datetime(a.publishedDate, 'unixepoch') as published,
+                  CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+                  CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+                  substr(a.unrSummary, 1, 300) as content_preview,
+                  snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
+                FROM articles a 
+                JOIN search_articles s ON a.search_articles_rowid = s.rowid 
+                WHERE a.archived=0 
+                  $filter_clause
+                  $feed_clause
+                  AND search_articles MATCH '$query' 
+                ORDER BY a.publishedDate DESC 
+                LIMIT $limit;"
+              fi
               ;;
           esac
-          
-          # Check if query is empty or wildcard - if so, return recently read articles
-          if [ -z "$query" ] || [ "$query" = "*" ]; then
-            # Return most recently read articles
-            # Return most recently read articles - always include a brief preview
-            sql_query="SELECT 
-              a.uniqueID,
-              a.title, 
-              a.feedName,
-              a.author, 
-              a.articleURL,
-              datetime(a.publishedDate, 'unixepoch') as published,
-              datetime(a.mark_read_date, 'unixepoch') as read_date,
-              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-              substr(a.unrSummary, 1, 300) as content_preview
-            FROM articles a 
-            WHERE a.archived=0 
-              AND a.read=1
-              AND a.mark_read_date IS NOT NULL
-              $filter_clause
-            ORDER BY a.mark_read_date DESC 
-            LIMIT $limit;"
-          else
-            # Execute search query with FTS - always include brief preview
-            sql_query="SELECT 
-              a.uniqueID,
-              a.title, 
-              a.feedName,
-              a.author, 
-              a.articleURL,
-              datetime(a.publishedDate, 'unixepoch') as published,
-              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-              substr(a.unrSummary, 1, 300) as content_preview,
-              snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
-            FROM articles a 
-            JOIN search_articles s ON a.search_articles_rowid = s.rowid 
-            WHERE a.archived=0 
-              $filter_clause
-              AND search_articles MATCH '$query' 
-            ORDER BY a.publishedDate DESC 
-            LIMIT $limit;"
-          fi
           
           # Log SQL query
           echo "\$\$ SQL: $sql_query" >> "$LOG_FILE"
           
-          # Execute query and format results
+          # Execute query
           results=$(sqlite3 -json "$DB_PATH" "$sql_query" 2>&1)
           exit_code=$?
           
-          if [ $exit_code -eq 0 ]; then
-            # Parse results and create formatted response
-            if [ -z "$results" ] || [ "$results" = "[]" ]; then
-              if [ -z "$query" ] || [ "$query" = "*" ]; then
-                result_text="No recently read articles found"
-              else
-                result_text="No articles found matching query: $query"
-              fi
-            else
-              # Count results
-              count=$(echo "$results" | jq 'length')
-              if [ -z "$query" ] || [ "$query" = "*" ]; then
-                result_text="$count most recently read articles:\n\n"
-              else
-                result_text="Found $count articles matching query: $query\n\n"
-              fi
-              
-              # Format each result
-              for i in $(seq 0 $((count - 1))); do
-                article=$(echo "$results" | jq -r ".[$i]")
-                article_id=$(echo "$article" | jq -r '.uniqueID // ""')
-                title=$(echo "$article" | jq -r '.title // "Untitled"')
-                feed=$(echo "$article" | jq -r '.feedName // "Unknown Feed"')
-                author=$(echo "$article" | jq -r '.author // ""')
-                url=$(echo "$article" | jq -r '.articleURL // ""')
-                published=$(echo "$article" | jq -r '.published // ""')
-                read_date=$(echo "$article" | jq -r '.read_date // ""')
-                status=$(echo "$article" | jq -r '.status // ""')
-                starred=$(echo "$article" | jq -r '.starred // ""')
-                matched=$(echo "$article" | jq -r '.matched_text // ""')
-                content=$(echo "$article" | jq -r '.content_preview // ""')
-                
-                result_text="${result_text}$(($i + 1)). $title\n"
-                result_text="${result_text}   Feed: $feed\n"
-                [ -n "$author" ] && result_text="${result_text}   Author: $author\n"
-                result_text="${result_text}   Published: $published\n"
-                [ -n "$read_date" ] && result_text="${result_text}   Read on: $read_date\n"
-                result_text="${result_text}   Status: $status"
-                [ "$starred" = "starred" ] && result_text="${result_text} ⭐"
-                result_text="${result_text}\n"
-                [ -n "$matched" ] && result_text="${result_text}   Match: $matched\n"
-                result_text="${result_text}   Article ID: $article_id\n"
-                [ -n "$url" ] && result_text="${result_text}   URL: $url\n"
-                
-                # Always show content preview if available
-                if [ -n "$content" ]; then
-                  result_text="${result_text}   Preview: $content"
-                  if [ ${#content} -ge 299 ]; then
-                    result_text="${result_text}..."
-                  fi
-                  result_text="${result_text}\n"
-                fi
-                
-                result_text="${result_text}\n"
-              done
-            fi
-            
-            # Create response
-            response=$(jq -cn --arg id "$id" --arg text "$result_text" '{
-              jsonrpc: "2.0",
-              id: ($id | tonumber),
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: $text
-                  }
-                ],
-                isError: false
-              }
-            }')
+          if [[ $exit_code -eq 0 ]]; then
+            # Format dual response
+            # Use original query for display purposes
+            original_query=$(echo "$line" | jq -r '.params.arguments.query // empty' 2>/dev/null)
+            mcp_result=$(format_dual_response "$results" "$original_query" "$search_type")
+            success_response "$id" "$mcp_result"
           else
-            # SQL error
-            response=$(jq -cn --arg id "$id" --arg text "Database error: $results" '{
-              jsonrpc: "2.0",
-              id: ($id | tonumber),
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: $text
-                  }
-                ],
-                isError: true
-              }
-            }')
+            error_response "$id" -32603 "Database error: $results"
           fi
-          
-          echo "<< $response" >> "$LOG_FILE"
-          echo "$response"
           ;;
           
-        "get-stats")
-          # Get database statistics
-          stats_query="SELECT 
-            COUNT(*) as total_articles,
-            SUM(CASE WHEN read=1 THEN 1 ELSE 0 END) as read_articles,
-            SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) as unread_articles,
-            SUM(CASE WHEN starred=1 THEN 1 ELSE 0 END) as starred_articles,
-            COUNT(DISTINCT feedName) as total_feeds
-          FROM articles 
-          WHERE archived=0;"
+        "fetch")
+          # Extract article ID/URL
+          article_url=$(echo "$line" | jq -r '.params.arguments.url // empty' 2>/dev/null)
           
-          results=$(sqlite3 -json "$DB_PATH" "$stats_query" 2>&1)
+          if [[ -z "$article_url" ]]; then
+            error_response "$id" -32602 "Missing required parameter: url"
+            return
+          fi
+          
+          # Get full article content
+          article_query="SELECT 
+            a.uniqueID,
+            a.title,
+            a.feedName,
+            a.author,
+            a.articleURL,
+            datetime(a.publishedDate, 'unixepoch') as published,
+            datetime(a.mark_read_date, 'unixepoch') as read_date,
+            CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
+            CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
+            a.unrSummary,
+            LENGTH(a.CompressedHtmlBlob) as has_html
+          FROM articles a 
+          WHERE a.uniqueID = '$article_url'
+          LIMIT 1;"
+          
+          results=$(sqlite3 -json "$DB_PATH" "$article_query" 2>&1)
           exit_code=$?
           
-          if [ $exit_code -eq 0 ]; then
-            # Parse stats
-            stats=$(echo "$results" | jq -r '.[0]')
-            total=$(echo "$stats" | jq -r '.total_articles')
-            read=$(echo "$stats" | jq -r '.read_articles')
-            unread=$(echo "$stats" | jq -r '.unread_articles')
-            starred=$(echo "$stats" | jq -r '.starred_articles')
-            feeds=$(echo "$stats" | jq -r '.total_feeds')
-            
-            result_text="Unread Database Statistics:\n\n"
-            result_text="${result_text}Total Articles: $total\n"
-            result_text="${result_text}Read Articles: $read\n"
-            result_text="${result_text}Unread Articles: $unread\n"
-            result_text="${result_text}Starred Articles: $starred\n"
-            result_text="${result_text}Total Feeds: $feeds"
-            
-            response=$(jq -cn --arg id "$id" --arg text "$result_text" '{
-              jsonrpc: "2.0",
-              id: ($id | tonumber),
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: $text
-                  }
-                ],
-                isError: false
-              }
-            }')
-          else
-            response=$(create_error_response "$id" "-32603" "Database error: $results")
-          fi
-          
-          echo "<< $response" >> "$LOG_FILE"
-          echo "$response"
-          ;;
-          
-        "get-article")
-          # Extract article ID
-          article_id=$(echo "$line" | jq -r '.params.arguments.article_id // empty' 2>/dev/null)
-          
-          if [ -z "$article_id" ]; then
-            response=$(create_error_response "$id" "-32602" "Article ID is required")
-          else
-            # Get full article content
-            article_query="SELECT 
-              a.uniqueID,
-              a.title,
-              a.feedName,
-              a.author,
-              a.articleURL,
-              datetime(a.publishedDate, 'unixepoch') as published,
-              datetime(a.mark_read_date, 'unixepoch') as read_date,
-              CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-              CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-              a.unrSummary,
-              LENGTH(a.CompressedHtmlBlob) as has_html
-            FROM articles a 
-            WHERE a.uniqueID = '$article_id'
-            LIMIT 1;"
-            
-            results=$(sqlite3 -json "$DB_PATH" "$article_query" 2>&1)
-            exit_code=$?
-            
-            if [ $exit_code -eq 0 ]; then
-              if [ -z "$results" ] || [ "$results" = "[]" ]; then
-                result_text="Article not found with ID: $article_id"
-              else
-                # Parse article data
-                article=$(echo "$results" | jq -r '.[0]')
-                title=$(echo "$article" | jq -r '.title // "Untitled"')
-                feed=$(echo "$article" | jq -r '.feedName // "Unknown Feed"')
-                author=$(echo "$article" | jq -r '.author // ""')
-                url=$(echo "$article" | jq -r '.articleURL // ""')
-                published=$(echo "$article" | jq -r '.published // ""')
-                read_date=$(echo "$article" | jq -r '.read_date // ""')
-                status=$(echo "$article" | jq -r '.status // ""')
-                starred=$(echo "$article" | jq -r '.starred // ""')
-                summary=$(echo "$article" | jq -r '.unrSummary // ""')
-                has_html=$(echo "$article" | jq -r '.has_html // "0"')
+          if [[ $exit_code -eq 0 ]]; then
+            if [[ -z "$results" ]] || [[ "$results" = "[]" ]]; then
+              error_response "$id" -32603 "Article not found with ID: $article_url"
+            else
+              # Parse article data
+              article=$(echo "$results" | jq -r '.[0]')
+              title=$(echo "$article" | jq -r '.title // "Untitled"')
+              feed=$(echo "$article" | jq -r '.feedName // "Unknown Feed"')
+              author=$(echo "$article" | jq -r '.author // ""')
+              url=$(echo "$article" | jq -r '.articleURL // ""')
+              published=$(echo "$article" | jq -r '.published // ""')
+              read_date=$(echo "$article" | jq -r '.read_date // ""')
+              status=$(echo "$article" | jq -r '.status // ""')
+              starred=$(echo "$article" | jq -r '.starred // ""')
+              summary=$(echo "$article" | jq -r '.unrSummary // ""')
+              has_html=$(echo "$article" | jq -r '.has_html // "0"')
+              
+              # Extract full content if available
+              full_content=""
+              if [[ "$has_html" != "0" ]] && [[ "$has_html" != "null" ]]; then
+                temp_file="/tmp/article_${article_url}_compressed.zlib"
+                sqlite3 "$DB_PATH" "SELECT writefile('$temp_file', CompressedHtmlBlob) FROM articles WHERE uniqueID = '$article_url';" 2>/dev/null
                 
-                # If we have compressed HTML, extract and decompress it
-                if [ "$has_html" != "0" ] && [ "$has_html" != "null" ]; then
-                  # Export compressed blob to temp file
-                  temp_file="/tmp/article_${article_id}_compressed.zlib"
-                  sqlite3 "$DB_PATH" "SELECT writefile('$temp_file', CompressedHtmlBlob) FROM articles WHERE uniqueID = '$article_id';" 2>/dev/null
-                  
-                  if [ -f "$temp_file" ]; then
-                    # Decompress and extract text
-                    full_content=$(python3 -c "
+                if [[ -f "$temp_file" ]]; then
+                  full_content=$(python3 -c "
 import zlib
 import re
 import html
@@ -475,239 +511,114 @@ try:
     with open('$temp_file', 'rb') as f:
         compressed = f.read()
     html_content = zlib.decompress(compressed).decode('utf-8')
-    # Remove HTML tags
     text = re.sub('<[^<]+?>', ' ', html_content)
-    # Decode HTML entities
     text = html.unescape(text)
-    # Clean up whitespace
     text = ' '.join(text.split())
     print(text)
-except Exception as e:
+except Exception:
     print('Error decompressing content')
 " 2>/dev/null)
-                    rm -f "$temp_file"
-                  else
-                    full_content=""
-                  fi
-                else
-                  full_content=""
-                fi
-                
-                # Build response
-                result_text="Article: $title\n\n"
-                result_text="${result_text}Feed: $feed\n"
-                [ -n "$author" ] && result_text="${result_text}Author: $author\n"
-                result_text="${result_text}Published: $published\n"
-                [ -n "$read_date" ] && result_text="${result_text}Read on: $read_date\n"
-                result_text="${result_text}Status: $status"
-                [ "$starred" = "starred" ] && result_text="${result_text} ⭐"
-                result_text="${result_text}\n"
-                [ -n "$url" ] && result_text="${result_text}URL: $url\n"
-                result_text="${result_text}\n--- Content ---\n\n"
-                
-                # Use full content if available, otherwise use summary
-                if [ -n "$full_content" ] && [ "$full_content" != "Error decompressing content" ]; then
-                  result_text="${result_text}$full_content"
-                elif [ -n "$summary" ]; then
-                  result_text="${result_text}[Summary only - full HTML content not available]\n\n$summary"
-                else
-                  result_text="${result_text}[No content available]"
+                  rm -f "$temp_file"
                 fi
               fi
               
-              response=$(jq -cn --arg id "$id" --arg text "$result_text" '{
-                jsonrpc: "2.0",
-                id: ($id | tonumber),
-                result: {
-                  content: [
-                    {
-                      type: "text",
-                      text: $text
-                    }
-                  ],
-                  isError: false
-                }
-              }')
-            else
-              response=$(create_error_response "$id" "-32603" "Database error: $results")
-            fi
-          fi
-          
-          echo "<< $response" >> "$LOG_FILE"
-          echo "$response"
-          ;;
-          
-        "list-feeds")
-          # Get feed list
-          limit=$(echo "$line" | jq -r '.params.arguments.limit // 30' 2>/dev/null)
-          
-          feeds_query="SELECT 
-            feedName,
-            COUNT(*) as article_count,
-            SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) as unread_count
-          FROM articles 
-          WHERE archived=0 AND feedName IS NOT NULL AND feedName != ''
-          GROUP BY feedName 
-          ORDER BY article_count DESC 
-          LIMIT $limit;"
-          
-          results=$(sqlite3 -json "$DB_PATH" "$feeds_query" 2>&1)
-          exit_code=$?
-          
-          if [ $exit_code -eq 0 ]; then
-            count=$(echo "$results" | jq 'length')
-            result_text="Top $count feeds by article count:\n\n"
-            
-            for i in $(seq 0 $((count - 1))); do
-              feed=$(echo "$results" | jq -r ".[$i]")
-              name=$(echo "$feed" | jq -r '.feedName')
-              total=$(echo "$feed" | jq -r '.article_count')
-              unread=$(echo "$feed" | jq -r '.unread_count')
+              # Build content text
+              content_text="Article: $title\n\nFeed: $feed\n"
+              [[ -n "$author" ]] && content_text="${content_text}Author: $author\n"
+              content_text="${content_text}Published: $published\n"
+              [[ -n "$read_date" ]] && content_text="${content_text}Read on: $read_date\n"
+              content_text="${content_text}Status: $status"
+              [[ "$starred" = "starred" ]] && content_text="${content_text} ⭐"
+              content_text="${content_text}\n"
+              [[ -n "$url" ]] && content_text="${content_text}URL: $url\n"
+              content_text="${content_text}\n--- Content ---\n\n"
               
-              result_text="${result_text}$(($i + 1)). $name\n"
-              result_text="${result_text}   Articles: $total (Unread: $unread)\n\n"
-            done
-            
-            response=$(jq -cn --arg id "$id" --arg text "$result_text" '{
-              jsonrpc: "2.0",
-              id: ($id | tonumber),
-              result: {
+              # Use full content if available, otherwise summary
+              if [[ -n "$full_content" ]] && [[ "$full_content" != "Error decompressing content" ]]; then
+                content_text="${content_text}$full_content"
+              elif [[ -n "$summary" ]]; then
+                content_text="${content_text}[Summary only - full HTML content not available]\n\n$summary"
+              else
+                content_text="${content_text}[No content available]"
+              fi
+              
+              # Format dual response
+              mcp_result=$(jq -cn --arg text "$content_text" --arg title "$title" --arg url "$article_url" '{
                 content: [
                   {
                     type: "text",
                     text: $text
                   }
                 ],
-                isError: false
-              }
-            }')
+                title: $title,
+                url: $url
+              }')
+              success_response "$id" "$mcp_result"
+            fi
           else
-            response=$(create_error_response "$id" "-32603" "Database error: $results")
+            error_response "$id" -32603 "Database error: $results"
           fi
-          
-          echo "<< $response" >> "$LOG_FILE"
-          echo "$response"
           ;;
           
-        "search-by-feed")
-          # Extract parameters
-          feed_name=$(echo "$line" | jq -r '.params.arguments.feed_name // empty' 2>/dev/null)
-          query=$(echo "$line" | jq -r '.params.arguments.query // empty' 2>/dev/null)
-          filter=$(echo "$line" | jq -r '.params.arguments.filter // "all"' 2>/dev/null)
-          limit=$(echo "$line" | jq -r '.params.arguments.limit // 20' 2>/dev/null)
-          
-          # Build filter clause
-          filter_clause=""
-          case "$filter" in
-            "starred")
-              filter_clause="AND a.starred=1"
+        # Legacy tool support for backward compatibility
+        "search-articles"|"get-article"|"get-stats"|"list-feeds"|"search-by-feed")
+          case "$tool_method" in
+            "get-stats")
+              response=$(create_json_response "$id" '{
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Please use the search tool with search_type=\"stats\" and query=\"*\" instead."
+                  }
+                ],
+                "isError": false
+              }')
               ;;
-            "unread")
-              filter_clause="AND a.read=0"
+            "list-feeds")
+              response=$(create_json_response "$id" '{
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Please use the search tool with search_type=\"feeds\" and query=\"*\" instead."
+                  }
+                ],
+                "isError": false
+              }')
               ;;
-            "read")
-              filter_clause="AND a.read=1"
+            *)
+              response=$(create_json_response "$id" '{
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "This tool has been consolidated. Please use the \"search\" tool for searching articles or \"fetch\" tool for getting article content."
+                  }
+                ],
+                "isError": false
+              }')
               ;;
           esac
-          
-          # Search within specific feed
-          sql_query="SELECT 
-            a.uniqueID,
-            a.title,
-            a.author,
-            a.articleURL,
-            datetime(a.publishedDate, 'unixepoch') as published,
-            CASE WHEN a.read=1 THEN 'read' ELSE 'unread' END as status,
-            CASE WHEN a.starred=1 THEN 'starred' ELSE '' END as starred,
-            substr(a.unrSummary, 1, 300) as content_preview,
-            snippet(search_articles, 3, '[', ']', '...', 32) as matched_text
-          FROM articles a 
-          JOIN search_articles s ON a.search_articles_rowid = s.rowid 
-          WHERE a.archived=0 
-            AND a.feedName = '$feed_name'
-            $filter_clause
-            AND search_articles MATCH '$query' 
-          ORDER BY a.publishedDate DESC 
-          LIMIT $limit;"
-          
-          results=$(sqlite3 -json "$DB_PATH" "$sql_query" 2>&1)
-          exit_code=$?
-          
-          if [ $exit_code -eq 0 ]; then
-            if [ -z "$results" ] || [ "$results" = "[]" ]; then
-              result_text="No articles found in feed '$feed_name' matching: $query"
-            else
-              count=$(echo "$results" | jq 'length')
-              result_text="Found $count articles in '$feed_name' matching: $query\n\n"
-              
-              for i in $(seq 0 $((count - 1))); do
-                article=$(echo "$results" | jq -r ".[$i]")
-                article_id=$(echo "$article" | jq -r '.uniqueID // ""')
-                title=$(echo "$article" | jq -r '.title // "Untitled"')
-                author=$(echo "$article" | jq -r '.author // ""')
-                url=$(echo "$article" | jq -r '.articleURL // ""')
-                published=$(echo "$article" | jq -r '.published // ""')
-                status=$(echo "$article" | jq -r '.status // ""')
-                starred=$(echo "$article" | jq -r '.starred // ""')
-                matched=$(echo "$article" | jq -r '.matched_text // ""')
-                content=$(echo "$article" | jq -r '.content_preview // ""')
-                
-                result_text="${result_text}$(($i + 1)). $title\n"
-                [ -n "$author" ] && result_text="${result_text}   Author: $author\n"
-                result_text="${result_text}   Published: $published\n"
-                result_text="${result_text}   Status: $status"
-                [ "$starred" = "starred" ] && result_text="${result_text} ⭐"
-                result_text="${result_text}\n"
-                [ -n "$matched" ] && result_text="${result_text}   Match: $matched\n"
-                result_text="${result_text}   Article ID: $article_id\n"
-                [ -n "$url" ] && result_text="${result_text}   URL: $url\n"
-                
-                # Always show content preview if available
-                if [ -n "$content" ]; then
-                  result_text="${result_text}   Preview: $content"
-                  if [ ${#content} -ge 299 ]; then
-                    result_text="${result_text}..."
-                  fi
-                  result_text="${result_text}\n"
-                fi
-                
-                result_text="${result_text}\n"
-              done
-            fi
-            
-            response=$(jq -cn --arg id "$id" --arg text "$result_text" '{
-              jsonrpc: "2.0",
-              id: ($id | tonumber),
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: $text
-                  }
-                ],
-                isError: false
-              }
-            }')
-          else
-            response=$(create_error_response "$id" "-32603" "Database error: $results")
-          fi
-          
           echo "<< $response" >> "$LOG_FILE"
           echo "$response"
           ;;
           
         *)
           # Unknown tool
-          response=$(create_error_response "$id" "-32601" "Tool not found: $tool_method")
-          echo "$response"
+          error_response "$id" -32601 "Tool not found: $tool_method"
           ;;
       esac
       ;;
       
+    "resources/list")
+      # OpenAI compatibility - return empty resources
+      success_response "$id" '{ "resources": [] }'
+      ;;
+    "prompts/list")
+      # OpenAI compatibility - return empty prompts
+      success_response "$id" '{ "prompts": [] }'
+      ;;
     *)
       # Method not found
-      response=$(create_error_response "$id" "-32601" "Method not found: $method")
-      echo "$response"
+      error_response "$id" -32601 "Method not found: $method"
       ;;
   esac
 done || true
